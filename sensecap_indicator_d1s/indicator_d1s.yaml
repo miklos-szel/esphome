@@ -1,0 +1,376 @@
+substitutions:
+  name: esphome-d1s-sensor
+  friendly_name: ESPHome D1S
+  <<: !include ../secrets.yml
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2025.11.0
+  name_add_mac_suffix: false
+  project:
+    name: esphome.sensecap-indicator
+    version: "1.0"
+
+esp32:
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESPTOOLPY_FLASHSIZE_8MB: y
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: y
+      CONFIG_ESP32S3_DATA_CACHE_64KB: y
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
+      CONFIG_SPIRAM_RODATA: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+  hardware_uart: UART0
+
+# WiFi Configuration
+wifi:
+  ssid: "${wifi_ssid}"
+  password: "${wifi_password}"
+  reboot_timeout: 0s
+  ap:
+    ssid: "${name} Fallback"
+    password: "sensecap123"
+
+captive_portal:
+
+# Allow Over-The-Air updates
+ota:
+  - platform: esphome
+
+# Web server for local access
+web_server:
+  port: 80
+
+# I2C bus for sensors and I/O expander
+i2c:
+  - id: bus_a
+    sda: GPIO39
+    scl: GPIO40
+    scan: false
+
+# SPI for display
+spi:
+  - id: lcd_spi
+    clk_pin: GPIO41
+    mosi_pin: GPIO48
+    miso_pin: GPIO47
+
+# I/O expander for display control pins
+pca9554:
+  - id: pca9554a_device
+    address: 0x20
+    pin_count: 16
+
+# Backlight control
+output:
+  - platform: ledc
+    pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    id: backlight_output
+    frequency: 100Hz
+
+light:
+  - platform: monochromatic
+    name: "Display Backlight"
+    id: display_backlight
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+
+# Global variables for brightness control
+globals:
+  - id: brightness_level
+    type: int
+    restore_value: yes
+    initial_value: '10'
+  - id: daytime_brightness
+    type: int
+    restore_value: yes
+    initial_value: '10'
+  - id: is_night
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# Time sync for sun calculations
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin
+
+# Sun component for sunrise/sunset detection
+sun:
+  latitude: 48.137154
+  longitude: 11.576124
+  on_sunset:
+    - then:
+        - lambda: |-
+            id(daytime_brightness) = id(brightness_level);  // Save current brightness
+            id(is_night) = true;
+        - light.turn_on:
+            id: display_backlight
+            brightness: 50%
+        - lambda: "id(brightness_level) = 5;"
+  on_sunrise:
+    - then:
+        - lambda: "id(is_night) = false;"
+        - light.turn_on:
+            id: display_backlight
+            brightness: !lambda "return id(daytime_brightness) / 10.0;"
+        - lambda: "id(brightness_level) = id(daytime_brightness);"
+
+# User button - cycles backlight brightness by 10%
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO38
+      inverted: true
+    name: "User Button"
+    on_press:
+      - lambda: |-
+          id(brightness_level) = (id(brightness_level) + 1) % 11;
+          if (id(brightness_level) == 0) id(brightness_level) = 1;  // Skip 0%, min is 10%
+      - light.turn_on:
+          id: display_backlight
+          brightness: !lambda "return id(brightness_level) / 10.0;"
+
+# Display - ST7701S with proper pin configuration
+display:
+  - platform: st7701s
+    id: sensecap_display
+    auto_clear_enabled: false
+    update_interval: 60s
+    spi_mode: MODE3
+    color_order: RGB
+    invert_colors: true
+    dimensions:
+      width: 480
+      height: 480
+    transform:
+      mirror_x: true
+      mirror_y: true
+    cs_pin:
+      pca9554: pca9554a_device
+      number: 4
+    reset_pin:
+      pca9554: pca9554a_device
+      number: 5
+    de_pin: 18
+    hsync_pin: 16
+    vsync_pin: 17
+    pclk_pin: 21
+    init_sequence:
+      - 1
+      - [ 0xE0, 0x1F ]
+    data_pins:
+      red:
+        - 4
+        - 3
+        - 2
+        - 1
+        - 0
+      green:
+        - 10
+        - 9
+        - 8
+        - 7
+        - 6
+        - 5
+      blue:
+        - 15
+        - 14
+        - 13
+        - 12
+        - 11
+    lambda: |-
+      // Get the current sensor values
+      float co2_value = id(co2_sensor).state;
+      float tmp_value = id(tmp_sensor).state;
+      float hum_value = id(hum_sensor).state;
+
+      // Soft, muted colors that are easy on the eyes
+      auto soft_green = Color(0x78, 0xC8, 0x78);   // Sage green
+      auto soft_amber = Color(0xF0, 0xB4, 0x50);   // Warm amber
+      auto soft_coral = Color(0xDC, 0x78, 0x64);   // Soft coral red
+      auto white = Color(0xFF, 0xFF, 0xFF);
+      auto dark_gray = Color(0x28, 0x28, 0x28);
+
+      // Graph position (leave room for Y-axis labels on left)
+      int graph_x = 80;
+      int graph_y = 200;
+      int graph_h = 130;
+      int graph_w = 360;
+      // Threshold line positions (y = graph_y + graph_h * (1 - value/2000))
+      int line_400 = graph_y + graph_h * 4 / 5;     // 400 ppm
+      int line_1000 = graph_y + graph_h / 2;        // 1000 ppm
+      int line_1400 = graph_y + graph_h * 3 / 10;   // 1400 ppm
+
+      // Determine background color based on CO2 levels
+      Color bg_color = soft_green;
+      Color text_color = dark_gray;
+      auto co2_font = id(my_font_3digit);
+
+      if (co2_value >= 1000 && co2_value <= 1400) {
+        bg_color = soft_amber;
+        co2_font = id(large_font);
+      } else if (co2_value > 1400) {
+        bg_color = soft_coral;
+        text_color = white;
+        co2_font = id(large_font);
+      } else if (co2_value < 200) {
+        co2_font = id(large_font);
+      }
+
+      // Draw background in sections (excluding graph area to preserve it)
+      // Top section (above graph)
+      it.filled_rectangle(0, 0, 480, graph_y, bg_color);
+      // Left section (beside graph)
+      it.filled_rectangle(0, graph_y, graph_x, graph_h + 40, bg_color);
+      // Right section (beside graph)
+      it.filled_rectangle(graph_x + graph_w, graph_y, 480 - graph_x - graph_w, graph_h + 40, bg_color);
+      // Bottom section (below graph)
+      it.filled_rectangle(0, graph_y + graph_h + 40, 480, 480 - graph_y - graph_h - 40, bg_color);
+
+      // White background for graph area (including x-axis labels)
+      it.filled_rectangle(graph_x, graph_y, graph_w, graph_h + 40, white);
+
+      // CO2 value
+      it.printf(240, 80, co2_font, text_color, TextAlign::CENTER, "%.0f", co2_value);
+
+      // Draw graph
+      it.graph(graph_x, graph_y, id(co2_graph), dark_gray);
+
+      // Threshold lines
+      it.horizontal_line(graph_x, line_400, graph_w, id(color_green));
+      it.horizontal_line(graph_x, line_400 + 1, graph_w, id(color_green));
+      it.horizontal_line(graph_x, line_1000, graph_w, id(color_yellow));
+      it.horizontal_line(graph_x, line_1000 + 1, graph_w, id(color_yellow));
+      it.horizontal_line(graph_x, line_1400, graph_w, id(color_red));
+      it.horizontal_line(graph_x, line_1400 + 1, graph_w, id(color_red));
+
+      // Y-axis labels
+      it.printf(graph_x - 5, graph_y, id(font_small), text_color, TextAlign::TOP_RIGHT, "2000");
+      it.printf(graph_x - 5, graph_y + 65, id(font_small), text_color, TextAlign::CENTER_RIGHT, "1000");
+      it.printf(graph_x - 5, graph_y + 130, id(font_small), text_color, TextAlign::BOTTOM_RIGHT, "0");
+
+      // X-axis labels
+      it.printf(graph_x, graph_y + 135, id(font_small), text_color, TextAlign::TOP_LEFT, "2h");
+      it.printf(graph_x + 180, graph_y + 135, id(font_small), text_color, TextAlign::TOP_CENTER, "1h");
+      it.printf(graph_x + 360, graph_y + 135, id(font_small), text_color, TextAlign::TOP_RIGHT, "now");
+
+      // Temperature and humidity
+      it.printf(20, 360, id(font_secondary), text_color, TextAlign::TOP_LEFT, "%.1fC", tmp_value);
+      it.printf(460, 360, id(font_secondary), text_color, TextAlign::TOP_RIGHT, "%.0f%%", hum_value);
+
+# Touchscreen
+touchscreen:
+  - platform: ft5x06
+    id: sensecap_touchscreen
+    transform:
+      mirror_x: true
+      mirror_y: true
+    on_touch:
+      - light.turn_on: display_backlight
+
+# Color definitions
+color:
+  - id: color_black
+    hex: '000000'
+  - id: color_green
+    hex: '00AA00'
+  - id: color_yellow
+    hex: 'FFD700'
+  - id: color_red
+    hex: 'FF0000'
+
+# Graph for CO2 history
+graph:
+  - id: co2_graph
+    sensor: co2_sensor
+    duration: 2h
+    width: 360
+    height: 130
+    border: true
+    x_grid: 20min
+    y_grid: 400
+    max_value: 2000
+    min_value: 0
+    line_thickness: 5
+    line_type: SOLID
+    color: color_black
+
+# Fonts
+font:
+  - file:
+      type: gfonts
+      family: "Ubuntu Mono"
+      weight: bold
+    id: large_font
+    size: 160
+  - file:
+      type: gfonts
+      family: "Ubuntu Mono"
+    id: font_small
+    size: 20
+  - file:
+      type: gfonts
+      family: "Ubuntu Mono"
+      weight: bold
+    id: my_font_3digit
+    size: 180
+  - file:
+      type: gfonts
+      family: "Ubuntu Mono"
+      weight: bold
+    id: font_secondary
+    size: 90
+
+# UART for RP2040 sensor communication
+uart:
+  - id: rp2040_uart
+    rx_pin: GPIO20
+    baud_rate: 115200
+
+# External component for D1S sensor reading
+# This communicates with the RP2040 co-processor that reads SCD41 (CO2) and SGP40 (VOC)
+external_components:
+  - source:
+      type: git
+      url: https://github.com/tobi1449/esphome-sensecap-indicator-sensors.git
+      ref: main
+    components: [sensecap_indicator_sensors]
+
+# Sensors from RP2040 via external component
+sensor:
+  - platform: sensecap_indicator_sensors
+    co2:
+      id: co2_sensor
+      name: "CO2 (SCD41)"
+    altitude: 405
+    tvoc:
+      name: "TVOC (SGP40)"
+    temperature:
+      name: "Temperature External (AHT41)"
+      id: tmp_sensor
+    temperature_internal:
+      name: "Temperature Internal (SCD41)"
+    humidity:
+      name: "Humidity External (AHT41)"
+      id: hum_sensor
+    humidity_internal:
+      name: "Humidity Internal (SCD41)"
+
+  # WiFi signal strength
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
