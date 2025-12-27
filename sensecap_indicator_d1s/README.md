@@ -2,6 +2,9 @@
 
 ESPHome configuration for the [SenseCAP Indicator D1S](https://www.seeedstudio.com/SenseCAP-Indicator-D1S-p-5645.html) - an ESP32-S3 device with a 480x480 LCD display and environmental sensors.
 
+![Screen](img/screen.jpg)
+
+
 ## Features
 
 - **CO2 monitoring** with color-coded display (green/amber/red based on levels)
